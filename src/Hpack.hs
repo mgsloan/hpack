@@ -1,6 +1,9 @@
 {-# LANGUAGE CPP #-}
 module Hpack (
   hpack
+, hpackSilent
+, Result(..)
+, Status(..)
 , version
 , main
 #ifdef TEST
@@ -84,29 +87,48 @@ parseVersion xs = case [v | (v, "") <- readP_to_S Version.parseVersion xs] of
   _ -> Nothing
 
 hpack :: FilePath -> Bool -> IO ()
-hpack = hpackWithVersion version
+hpack = hpackWithVersionStdio version
 
-hpackWithVersion :: Version -> FilePath -> Bool -> IO ()
-hpackWithVersion v dir verbose = do
-  (warnings, name, new) <- run dir
-  forM_ warnings $ \warning -> hPutStrLn stderr ("WARNING: " ++ warning)
+hpackSilent :: FilePath -> IO Result
+hpackSilent = hpackWithVersion version
 
-  old <- either (const Nothing) (Just . splitHeader) <$> tryJust (guard . isDoesNotExistError) (readFile name >>= (return $!!))
+data Result = Result {
+  resultWarnings :: [String]
+, resultCabalFile :: String
+, resultStatus :: Status
+}
+
+data Status = Generated | AlreadyGeneratedByNewerHpack | OutputUnchanged
+
+hpackWithVersionStdio :: Version -> FilePath -> Bool -> IO ()
+hpackWithVersionStdio v dir verbose = do
+    r <- hpackWithVersion v dir
+    forM_ (resultWarnings r) $ \warning -> hPutStrLn stderr ("WARNING: " ++ warning)
+    when verbose $ putStrLn $
+      case resultStatus r of
+        Generated -> "generated " ++ resultCabalFile r
+        OutputUnchanged -> resultCabalFile r ++ " is up-to-date"
+        AlreadyGeneratedByNewerHpack -> resultCabalFile r ++ " was generated with a newer version of hpack, please upgrade and try again."
+
+hpackWithVersion :: Version -> FilePath -> IO Result
+hpackWithVersion v dir = do
+  (warnings, cabalFile, new) <- run dir
+  old <- either (const Nothing) (Just . splitHeader) <$> tryJust (guard . isDoesNotExistError) (readFile cabalFile >>= (return $!!))
   let oldVersion = fmap fst old >>= extractVersion
-
-  if (oldVersion <= Just v) then do
-    if (fmap snd old == Just (lines new)) then do
-      output (name ++ " is up-to-date")
-    else do
-      (writeFile name $ header v ++ new)
-      output ("generated " ++ name)
-  else do
-    output (name ++ " was generated with a newer version of hpack, please upgrade and try again.")
+  status <-
+    if (oldVersion <= Just v) then
+      if (fmap snd old == Just (lines new)) then
+        return OutputUnchanged
+      else do
+        writeFile cabalFile $ header v ++ new
+        return Generated
+    else
+      return AlreadyGeneratedByNewerHpack
+  return Result
+    { resultWarnings = warnings
+    , resultCabalFile = cabalFile
+    , resultStatus = status
+    }
   where
     splitHeader :: String -> ([String], [String])
     splitHeader = fmap (dropWhile null) . span ("--" `isPrefixOf`) . lines
-
-    output :: String -> IO ()
-    output message
-      | verbose = putStrLn message
-      | otherwise = return ()
